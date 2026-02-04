@@ -1,3 +1,4 @@
+import pLimit from 'p-limit';
 import Papa from 'papaparse';
 import { COMPANIES_EXPECTED_VALUES } from './../../models/company/helpers/utils/variables';
 import {
@@ -91,6 +92,54 @@ export const checkAllImages = async (
     isImagesIdsValid: isImages,
     imagesIdsArray: imagesArray,
   };
+};
+
+export type ImageKey = string;
+export const getImageKey = (img: any): ImageKey => {
+  if (!img) return '';
+  if (typeof img === 'string') return img;
+  return String(img.url ?? img.id ?? img.key ?? img.name ?? '');
+};
+
+export const checkAllImagesBulkCached = async (
+  images: any[],
+  tenantId: any,
+  isImageCheck = false,
+  concurrency = 20,
+) => {
+  // key -> { ok, id }
+  const cache = new Map<ImageKey, Promise<{ ok: boolean; id?: any }>>();
+  const limit = pLimit(concurrency);
+
+  const ensure = (img: any) => {
+    const key = getImageKey(img);
+    if (!key) return Promise.resolve({
+      ok: false,
+      id: undefined
+    });
+
+    let p = cache.get(key);
+    if (!p) {
+      p = limit(async () => {
+        const { isAvatarValid, fileFoundId } = await validateAndGetAvatarFileId(
+          img,
+          tenantId,
+          isImageCheck,
+        );
+        return { ok: Boolean(isAvatarValid), id: fileFoundId };
+      });
+      cache.set(key, p);
+    }
+    return p;
+  };
+
+  // важливо: порядок зберігаємо як у input images
+  const results = await Promise.all(images.map((img) => ensure(img)));
+
+  const isImagesIdsValid = results.every((r) => r.ok);
+  const imagesIdsArray = isImagesIdsValid ? results.map((r) => r.id) : [];
+
+  return { isImagesIdsValid, imagesIdsArray, cache };
 };
 
 export const parseHeaders = (

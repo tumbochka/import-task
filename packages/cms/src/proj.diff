@@ -1,3 +1,401 @@
+diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/CHANGES_DESCRIPTION.md /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/CHANGES_DESCRIPTION.md
+--- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/CHANGES_DESCRIPTION.md	1970-01-01 03:00:00
++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/CHANGES_DESCRIPTION.md	2026-02-03 17:44:46
+@@ -0,0 +1,394 @@
++# Детальний опис змін у коді
++
++## Огляд
++Diff-файл містить зміни в 11 файлах, що стосуються оптимізації процесу імпорту продуктів з CSV. Основні зміни спрямовані на:
++- Розбиття великих імпортів на чанки для паралельної обробки
++- Оптимізацію створення записів у базі даних
++- Покращення відстеження прогресу імпорту через Redis
++- Додавання метаданих для файлів
++
++---
++
++## 1. `api/chat-notification/controllers/chat-notification.ts`
++
++**Зміни:**
++- Видалено закоментований код з прикладом webhook-даних для події `onMessageAdded`
++- Прибрано 19 рядків коментарів з прикладом структури даних Twilio webhook
++
++**Причина:** Очищення коду від застарілих коментарів
++
++---
++
++## 2. `api/redis/helpers/utils/importChunksCounter.ts` ⭐ НОВИЙ ФАЙЛ
++
++**Призначення:** Утиліти для відстеження прогресу обробки чанків імпорту через Redis
++
++**Додані функції:**
++
++### `setChunksTotal(generatedRegex, tenantId, total)`
++- Встановлює загальну кількість чанків для імпорту
++- Ініціалізує лічильник виконаних чанків на 0
++
++### `incrChunksDone(generatedRegex, tenantId)`
++- Збільшує лічильник виконаних чанків на 1
++- Повертає поточне значення
++
++### `getChunksTotal(generatedRegex, tenantId)`
++- Отримує загальну кількість чанків
++
++### `getChunksDone(generatedRegex, tenantId)`
++- Отримує кількість виконаних чанків
++
++### `addProductTimes(generatedRegex, tenantId, productTimes)`
++- Додає масив часів обробки продуктів до Redis списку
++- Використовує `RPUSH` для додавання значень
++
++### `getAllProductTimes(generatedRegex, tenantId)`
++- Отримує всі збережені часи обробки продуктів
++- Повертає масив чисел
++
++### `clearProductTimes(generatedRegex, tenantId)`
++- Видаляє всі збережені часи обробки продуктів
++
++**Структура ключів Redis:**
++```
++{PRODUCTS_IMPORT_IDENTIFIER}:{tenantId}:{generatedRegex}:chunksTotal
++{PRODUCTS_IMPORT_IDENTIFIER}:{tenantId}:{generatedRegex}:chunksDone
++{PRODUCTS_IMPORT_IDENTIFIER}:{tenantId}:{generatedRegex}:productTimes
++```
++
++---
++
++## 3. `graphql/helpers/importingHelpers/fileHelper.ts`
++
++**Зміни:**
++- Додано запис метаданих у `provider_metadata` перед завантаженням файлу
++- Зберігається `uploadedByUserId` та `tenantId` для подальшого використання
++
++**Код:**
++```typescript
++entity.provider_metadata = {
++  ...(entity.provider_metadata ?? {}),
++  uploadedByUserId: userId,
++  tenantId: tenantFilter?.tenant,
++};
++```
++
++**Причина:** Дозволяє отримати інформацію про користувача, який завантажив файл, навіть коли контекст недоступний (наприклад, у воркерах)
++
++---
++
++## 4. `graphql/helpers/importingHelpers/redisHelpers.ts`
++
++**Додані імпорти:**
++- `completedImportingData` - для збереження успішно імпортованих продуктів
++- `updatingImportingData` - для збереження продуктів, що потребують оновлення
++
++**Нові функції:**
++
++### `safeJsonParse<T>(s: string): T | null`
++- Безпечний парсинг JSON з обробкою помилок
++- Повертає `null` при невалідному JSON
++
++### `loadImportingList<T>(generatedRegex, tenantId, importIdentifier, generator)`
++- Завантажує список об'єктів з Redis списку
++- Генерує ключ через функцію `generator`
++- Парсить JSON з кожного елемента списку
++- Фільтрує невалідні записи
++- **Примітка:** Порядок зворотний через використання `LPUSH`, але для репорту не критично
++
++### `loadAllImportingResults(generatedRegex, tenantId, importIdentifier)`
++- Завантажує всі результати імпорту одночасно через `Promise.all`
++- Повертає об'єкт з трьома списками:
++  - `spoiled` - зіпсовані записи
++  - `completed` - успішно імпортовані
++  - `updating` - записи, що оновлюються
++
++**Причина:** Централізоване завантаження результатів імпорту для фіналізації
++
++---
++
++## 5. `graphql/models/contact/types/types.ts`
++
++**Зміни:**
++- Додано опціональне поле `provider_metadata?: Record<string, any>` до інтерфейсу
++
++**Причина:** Підтримка метаданих файлів у типізації
++
++---
++
++## 6. `graphql/models/product/helpers/importing/utils/helpers/handleNormalisedFields.ts`
++
++**Основні зміни:**
++
++### Додано параметр `options`:
++```typescript
++options?: {
++  skipFinalize?: boolean;  // Пропустити фіналізацію імпорту
++  skipLogs?: boolean;      // Пропустити логування
++  totalProducts?: number; // Загальна кількість продуктів (для прогресу)
++}
++```
++
++### Змінено сигнатуру функції:
++- Додано опціональний параметр `options`
++- Змінено тип повернення на `Promise<{ productTimes: number[] }>`
++- Функція тепер повертає масив часів обробки кожного продукту
++
++### Логіка обробки:
++
++1. **Умовне логування:**
++   - Всі `console.log` обгорнуті перевіркою `if (!skipLogs)`
++   - Дозволяє прибрати зайве логування при паралельній обробці
++
++2. **Умовна фіналізація:**
++   - Виклик `processAndUpdateImports` обгорнуто в `if (!skipFinalize)`
++   - Дозволяє відкласти фіналізацію до завершення всіх чанків
++
++3. **Підтримка загальної кількості продуктів:**
++   - Використовується `totalProducts` з опцій або `normalizedFields.length`
++   - Дозволяє показувати правильний прогрес при обробці чанків
++
++4. **Повернення метрик:**
++   - Функція повертає `{ productTimes: number[] }` для збору статистики
++
++5. **Форматування коду:**
++   - Виправлено форматування у кількох місцях (пробіли, відступи)
++
++**Причина:** Підтримка чанкової обробки з можливістю відкласти фіналізацію та зібрати статистику
++
++---
++
++## 7. `graphql/models/product/helpers/importing/utils/utils.ts`
++
++**Оптимізація створення записів інвентаризації:**
++
++### До змін:
++- Створення записів по одному через `strapi.entityService.create`
++- Розмір чанка: 100 записів
++- Використання `Promise.all` для паралельного створення
++
++### Після змін:
++- Використання `strapi.db.query().createMany()` для масового створення
++- Розмір чанка: 500 записів (збільшено в 5 разів)
++- Створення всіх записів одночасно через `Array.from()`
++- Більш ефективне використання бази даних
++
++**Код:**
++```typescript
++const RECORD_BATCH = 500;
++const INV_RECORD_UID = 'api::invt-itm-record.invt-itm-record';
++
++const rows = Array.from({ length: quantity }, () => ({ ...baseRecord }));
++
++for (let i = 0; i < rows.length; i += RECORD_BATCH) {
++  const chunk = rows.slice(i, i + RECORD_BATCH);
++  await strapi.db.query(INV_RECORD_UID).createMany({ data: chunk });
++}
++```
++
++**Переваги:**
++- Значно швидше створення великої кількості записів
++- Менше запитів до бази даних
++- Краще використання транзакцій БД
++
++---
++
++## 8. `graphql/models/product/resolvers/createProductsFromCSV.ts` ⭐ МАСШТАБНІ ЗМІНИ
++
++**Основна мета:** Рефакторинг для підтримки чанкової обробки великих імпортів
++
++### Структурні зміни:
++
++#### A. Додано нові імпорти:
++- `importChunksCounter` - утиліти для відстеження чанків
++- `loadAllImportingResults` - завантаження результатів
++- `processAndUpdateImports` - фіналізація імпорту
++- `processProductsImport` - генерація звіту
++
++#### B. Додано функцію `chunkArray<T>`:
++```typescript
++const chunkArray = <T,>(arr: T[], size: number): T[][] => {
++  const out: T[][] = [];
++  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
++  return out;
++};
++```
++- Розбиває масив на чанки заданого розміру
++
++#### C. Рефакторинг Worker'а:
++
++**До:** Один тип завдання, що обробляє всі продукти одразу
++
++**Після:** Три типи завдань:
++
++1. **`products-chunk`** - обробка одного чанка продуктів:
++   - Отримує чанк нормалізованих полів
++   - Викликає `handleNormalisedProductsFields` з `skipFinalize: true` та `skipLogs: true`
++   - Зберігає часи обробки через `addProductTimes`
++   - Збільшує лічильник виконаних чанків
++   - Логує прогрес
++
++2. **`products-finalize`** - фіналізація імпорту:
++   - Перевіряє, чи всі чанки виконані
++   - Якщо ні - переплановує себе з затримкою 2 секунди
++   - Якщо так - завантажує всі результати з Redis
++   - Викликає `processAndUpdateImports` для фіналізації
++   - Виводить статистику по часу обробки
++   - Очищає тимчасові дані
++
++3. **Unknown job** - обробка невідомих типів завдань
++
++#### D. Налаштування Worker'а:
++- Додано `concurrency: 4` - одночасно обробляється до 4 чанків
++
++#### E. Зміни в resolver'і `createProductsFromCSV`:
++
++**До:**
++```typescript
++await productsImportFieldsQueue.add(PRODUCTS_IMPORT_IDENTIFIER, {
++  normalizedFields, // всі продукти одразу
++  // ... інші дані
++});
++```
++
++**Після:**
++```typescript
++const CHUNK_SIZE = 50;
++const chunks = chunkArray(normalizedFields, CHUNK_SIZE);
++const totalProducts = normalizedFields.length;
++
++// Встановлюємо загальну кількість чанків
++await setChunksTotal(generatedRegex, tenantFilter?.tenant, chunks.length);
++
++// Додаємо всі чанки одночасно
++await productsImportFieldsQueue.addBulk(
++  chunks.map((fieldsChunk, idx) => ({
++    name: 'products-chunk',
++    data: {
++      normalizedFields: fieldsChunk,
++      chunkIndex: idx,
++      chunksTotal: chunks.length,
++      totalProducts,
++      // ... інші дані
++    },
++  }))
++);
++
++// Додаємо завдання фіналізації
++await productsImportFieldsQueue.add('products-finalize', {
++  // ... дані для фіналізації
++}, {
++  delay: 1000, // затримка 1 секунда
++});
++```
++
++### Переваги нової архітектури:
++
++1. **Паралельна обробка:** До 4 чанків обробляються одночасно
++2. **Масштабованість:** Великі імпорти не блокуют систему
++3. **Відстеження прогресу:** Можна відстежувати прогрес через Redis
++4. **Відмовостійкість:** Якщо один чанк падає, інші продовжують обробку
++5. **Статистика:** Збір метрик по часу обробки кожного продукту
++
++### Логування:
++- `IMPORT_SESSION_START` - початок сесії імпорту
++- `IMPORT_CHUNK_START` - початок обробки чанка
++- `IMPORT_CHUNK_COMPLETE` - завершення чанка
++- `IMPORT_SESSION_PROGRESS` - прогрес обробки
++- `IMPORT_TIMING` - статистика по часу
++
++---
++
++## 9. `graphql/schema.graphql`
++
++**Зміни:**
++- Автоматично згенерований файл схеми GraphQL
++- Містить повну схему з усіма типами, входами та виходами
++- Файл містить 19138 рядків (повна схема системи)
++
++**Примітка:** Це автогенерований файл, зміни в ньому відображають оновлення схеми через зміни в коді
++
++---
++
++## 10. `index.ts`
++
++**Зміни в обробці завантаження файлів:**
++
++### До:
++```typescript
++const userId = ctx?.state?.user?.id;
++```
++
++### Після:
++```typescript
++let userId;
++if (ctx) {
++  userId = ctx?.state?.user?.id;
++} else {
++  const meta = file?.provider_metadata || {};
++  userId = meta?.uploadedByUserId;
++}
++```
++
++**Додано перевірку:**
++```typescript
++if (!ctx) return; // cannot update counts without a context
++```
++
++**Причина:** 
++- Дозволяє отримати `userId` навіть коли контекст недоступний (наприклад, у воркерах)
++- Використовує збережені метадані з `provider_metadata`
++- Запобігає помилкам при оновленні лічильників без контексту
++
++---
++
++## 11. `proj.diff`
++
++**Зміни:**
++- Сам diff-файл додано до репозиторію
++- Містить всі описані вище зміни
++
++---
++
++## Загальний вплив змін
++
++### Проблеми, що вирішуються:
++
++1. **Продуктивність:**
++   - Великі імпорти тепер обробляються паралельно
++   - Оптимізовано створення записів у БД (createMany замість окремих create)
++   - Зменшено навантаження на систему
++
++2. **Масштабованість:**
++   - Система може обробляти імпорти будь-якого розміру
++   - Чанки обробляються незалежно один від одного
++
++3. **Відстеження:**
++   - Покращено відстеження прогресу через Redis
++   - Збір статистики по часу обробки
++   - Можливість моніторингу стану імпорту
++
++4. **Надійність:**
++   - Відмовостійкість при обробці великих імпортів
++   - Можливість відновлення після помилок
++   - Логування на кожному етапі
++
++### Технічні деталі:
++
++- **Розмір чанка:** 50 продуктів на чанк
++- **Конкурентність:** До 4 чанків одночасно
++- **Розмір батчу БД:** 500 записів
++- **Затримка фіналізації:** 1 секунда (з можливістю повторного планування)
++
++---
++
++## Висновок
++
++Зміни представляють собою масштабну оптимізацію системи імпорту продуктів, що дозволяє:
++- Ефективно обробляти великі обсяги даних
++- Паралельно обробляти кілька чанків
++- Відстежувати прогрес та збирати статистику
++- Підвищити продуктивність через оптимізацію запитів до БД
++
++Всі зміни зворотно сумісні та не порушують існуючий функціонал.
 diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/api/chat-notification/controllers/chat-notification.ts /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/api/chat-notification/controllers/chat-notification.ts
 --- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/api/chat-notification/controllers/chat-notification.ts	2026-01-27 01:28:17
 +++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/api/chat-notification/controllers/chat-notification.ts	2026-02-03 17:31:39
@@ -168,6 +566,69 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql
 +
 +  return { spoiled, completed, updating };
  };
+diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/helpers/importingHelpers/utils.ts /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/helpers/importingHelpers/utils.ts
+--- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/helpers/importingHelpers/utils.ts	2026-01-27 01:28:17
++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/helpers/importingHelpers/utils.ts	2026-02-04 18:03:27
+@@ -1,3 +1,4 @@
++import pLimit from 'p-limit';
+ import Papa from 'papaparse';
+ import { COMPANIES_EXPECTED_VALUES } from './../../models/company/helpers/utils/variables';
+ import {
+@@ -91,6 +92,54 @@
+     isImagesIdsValid: isImages,
+     imagesIdsArray: imagesArray,
+   };
++};
++
++export type ImageKey = string;
++export const getImageKey = (img: any): ImageKey => {
++  if (!img) return '';
++  if (typeof img === 'string') return img;
++  return String(img.url ?? img.id ?? img.key ?? img.name ?? '');
++};
++
++export const checkAllImagesBulkCached = async (
++  images: any[],
++  tenantId: any,
++  isImageCheck = false,
++  concurrency = 20,
++) => {
++  // key -> { ok, id }
++  const cache = new Map<ImageKey, Promise<{ ok: boolean; id?: any }>>();
++  const limit = pLimit(concurrency);
++
++  const ensure = (img: any) => {
++    const key = getImageKey(img);
++    if (!key) return Promise.resolve({
++      ok: false,
++      id: undefined
++    });
++
++    let p = cache.get(key);
++    if (!p) {
++      p = limit(async () => {
++        const { isAvatarValid, fileFoundId } = await validateAndGetAvatarFileId(
++          img,
++          tenantId,
++          isImageCheck,
++        );
++        return { ok: Boolean(isAvatarValid), id: fileFoundId };
++      });
++      cache.set(key, p);
++    }
++    return p;
++  };
++
++  // важливо: порядок зберігаємо як у input images
++  const results = await Promise.all(images.map((img) => ensure(img)));
++
++  const isImagesIdsValid = results.every((r) => r.ok);
++  const imagesIdsArray = isImagesIdsValid ? results.map((r) => r.id) : [];
++
++  return { isImagesIdsValid, imagesIdsArray, cache };
+ };
+ 
+ export const parseHeaders = (
 diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/contact/types/types.ts /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/contact/types/types.ts
 --- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/contact/types/types.ts	2026-01-27 01:28:17
 +++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/contact/types/types.ts	2026-02-03 17:31:38
@@ -177,10 +638,93 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql
    getStream?: () => Readable;
 +  provider_metadata?: Record<string, any>;
  }
+diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/actions/handleNormalisedFields/checkSerialNumbersAvailability.ts /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/actions/handleNormalisedFields/checkSerialNumbersAvailability.ts
+--- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/actions/handleNormalisedFields/checkSerialNumbersAvailability.ts	2026-01-27 01:28:17
++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/actions/handleNormalisedFields/checkSerialNumbersAvailability.ts	2026-02-04 17:44:59
+@@ -55,3 +55,55 @@
+     handleError('checkSerialNumbersAvailability', undefined, e);
+   }
+ };
++
++export const checkSerialNumbersAvailabilityBulk = async ({
++  serialNumbers,
++  tenantFilter,
++}: {
++  serialNumbers: string[];
++  tenantFilter: any;
++}) => {
++  const unique = Array.from(
++    new Set(serialNumbers.filter(Boolean).map((s) => String(s).trim())),
++  );
++
++  if (unique.length === 0) {
++    return { busySerials: new Set<string>() };
++  }
++
++  const existed = await strapi.entityService.findMany(
++    'api::inventory-serialize.inventory-serialize',
++    {
++      filters: {
++        ...tenantFilter,
++        name: { $in: unique },
++      },
++      fields: ['name'],
++      populate: {
++        sellingProductOrderItem: { fields: ['id'] },
++        returnItem: { fields: ['id'] },
++        inventoryAdjustmentItem: { fields: ['id'] },
++        transferOrderItem: { fields: ['id'] },
++        productInventoryItem: { fields: ['id'] },
++      },
++    },
++  );
++
++  const busySerials = new Set<string>();
++
++  for (const sn of existed as any[]) {
++    const name = String(sn?.name ?? '').trim();
++    if (!name) continue;
++
++    const hasRelations =
++      sn?.sellingProductOrderItem?.id ||
++      sn?.returnItem?.id ||
++      sn?.inventoryAdjustmentItem?.id ||
++      sn?.transferOrderItem?.id ||
++      sn?.productInventoryItem?.id;
++
++    if (hasRelations) busySerials.add(name);
++  }
++
++  return { busySerials };
++};
 diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/handleNormalisedFields.ts /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/handleNormalisedFields.ts
 --- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/handleNormalisedFields.ts	2026-01-27 01:28:17
-+++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/handleNormalisedFields.ts	2026-02-03 17:31:38
-@@ -32,9 +32,16 @@
++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/handleNormalisedFields.ts	2026-02-04 18:52:34
+@@ -4,12 +4,13 @@
+ import { handleLogger } from './../../../../../../helpers/errors';
+ import { processAndUpdateImports } from './../../../../../../helpers/importingHelpers/fileHelper';
+ import {
+-  checkAllImages,
++  checkAllImagesBulkCached,
+   findCashPaymentMethodId,
+   findCostOfGoodsAccountId,
+   findExistingRelationEntities,
+   findOrCreateEntities,
+   getExistingEntitiesByFieldBatch,
++  getImageKey,
+ } from './../../../../../../helpers/importingHelpers/utils';
+ import { processProductsImport } from './../../../createProductsFromCSV/generateImportReport';
+ import {
+@@ -19,7 +20,7 @@
+   handleSpoiledCreations,
+ } from './../../../importing/productImport';
+ import { validateProductQuantities } from './../../../importing/utils/utils';
+-import { checkSerialNumbersAvailability } from './../helpers/actions/handleNormalisedFields/checkSerialNumbersAvailability';
++import { checkSerialNumbersAvailabilityBulk } from './../helpers/actions/handleNormalisedFields/checkSerialNumbersAvailability';
+ import {
+   batchProcessCustomAttributes,
+   getProductAttributeOptionIds,
+@@ -32,9 +33,16 @@
    { maxImagesCount, maxProductsCount, customFieldsArr, maxSerialNumbersCount },
    config,
    currentSessionId,
@@ -199,7 +743,132 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql
    const allNames = normalizedFields
      .map((product) => product.name)
      .filter(Boolean);
-@@ -181,7 +188,7 @@
+@@ -109,6 +117,124 @@
+     batchProcessCustomAttributes(normalizedFields, tenantFilter?.tenant),
+   ]);
+ 
++  // -------------------------
++  // PREFETCH (per chunk)
++  // -------------------------
++
++  // 2.1 Images prefetch (1 call per chunk)
++  // IMPORTANT: relies on checkAllImagesBulkCached returning ids in the same order as input images array
++  const imagesValidByIdx = new Map<number, boolean>();
++  const imageIdsByIdx = new Map<number, any[]>();
++
++  (() => {
++    normalizedFields.forEach((_, idx) => {
++      imagesValidByIdx.set(idx, true);
++      imageIdsByIdx.set(idx, []);
++    });
++  })();
++
++  const uniqueImageKeyToRef = new Map<string, any>();
++  const productImageKeysByIdx = new Map<number, string[]>();
++
++  normalizedFields.forEach((product, idx) => {
++    const productImages = Array.isArray(product?.images) ? product.images : [];
++    const imageKeys = productImages.map(getImageKey).filter(Boolean);
++
++    productImageKeysByIdx.set(idx, imageKeys);
++
++    for (let imageIndex = 0; imageIndex < productImages.length; imageIndex++) {
++      const imageKey = getImageKey(productImages[imageIndex]);
++      if (imageKey) uniqueImageKeyToRef.set(imageKey, productImages[imageIndex]);
++    }
++  });
++
++  if (uniqueImageKeyToRef.size > 0) {
++    const allUniqueImages = Array.from(uniqueImageKeyToRef.values());
++
++    const { cache: imageCache } = await checkAllImagesBulkCached(
++      allUniqueImages,
++      tenantFilter.tenant,
++      true,
++      20,
++    );
++
++    for (let idx = 0; idx < normalizedFields.length; idx++) {
++      const product = normalizedFields[idx];
++      const productImages = Array.isArray(product?.images) ? product.images : [];
++      if (productImages.length === 0) {
++        imagesValidByIdx.set(idx, true);
++        imageIdsByIdx.set(idx, []);
++        continue;
++      }
++
++      const imageValidationChecks = await Promise.all(
++        productImages.map(async (img) => {
++          const imageKey = getImageKey(img);
++          const cachedPromise = imageCache?.get(imageKey);
++          return cachedPromise ?? Promise.resolve({ ok: false });
++        }),
++      );
++
++      const allImagesValid = imageValidationChecks.every((r) => r.ok);
++      imagesValidByIdx.set(idx, allImagesValid);
++      imageIdsByIdx.set(
++        idx,
++        allImagesValid ? imageValidationChecks.map((r) => r.id) : [],
++      );
++    }
++  }
++
++  // 2.2 Serial numbers prefetch (1 call per chunk)
++  const serialsOkByIdx = new Map<number, boolean>();
++
++  const allChunkSerialsSet = new Set<string>();
++
++  normalizedFields.forEach((product) => {
++    const productItems = Array.isArray(product?.productItems)
++      ? product.productItems
++      : [];
++    for (const productItem of productItems) {
++      const serialNumbers = Array.isArray(productItem?.serialNumbers)
++        ? productItem.serialNumbers
++        : [];
++      for (const serialNumber of serialNumbers) {
++        const trimmedSerial = String(serialNumber).trim();
++        if (trimmedSerial) allChunkSerialsSet.add(trimmedSerial);
++      }
++    }
++  });
++
++  let busySerials = new Set<string>();
++  if (allChunkSerialsSet.size > 0) {
++    const bulkCheckResult = await checkSerialNumbersAvailabilityBulk({
++      serialNumbers: Array.from(allChunkSerialsSet),
++      tenantFilter,
++    });
++    busySerials = bulkCheckResult.busySerials;
++  }
++
++  normalizedFields.forEach((product, idx) => {
++    const productItems = Array.isArray(product?.productItems)
++      ? product.productItems
++      : [];
++    const productSerials: string[] = [];
++
++    for (const productItem of productItems) {
++      const serialNumbers = Array.isArray(productItem?.serialNumbers)
++        ? productItem.serialNumbers
++        : [];
++      for (const serialNumber of serialNumbers) {
++        const trimmedSerial = String(serialNumber).trim();
++        if (trimmedSerial) productSerials.push(trimmedSerial);
++      }
++    }
++
++    const allSerialsAvailable = productSerials.every(
++      (trimmedSerial) => !busySerials.has(trimmedSerial),
++    );
++    serialsOkByIdx.set(idx, allSerialsAvailable);
++  });
++
+   const getEntityIdByName = (
+     entityArray: any[],
+     name: string,
+@@ -181,7 +307,7 @@
  
    // Monitoring metrics
    const metrics = {
@@ -208,7 +877,7 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql
      processed: 0,
      active: 0,
      maxActive: 0,
-@@ -192,6 +199,7 @@
+@@ -192,6 +318,7 @@
    };
  
    const logProgress = () => {
@@ -216,8 +885,12 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql
      console.log(
        `[IMPORT PROGRESS] Processed: ${metrics.processed}/${metrics.totalProducts} | ` +
          `Active: ${metrics.active} | MaxActive: ${metrics.maxActive} | ` +
-@@ -204,9 +212,11 @@
-       const CONCURRENCY_LIMIT = 20;
+@@ -201,12 +328,14 @@
+ 
+   try {
+     if (normalizedFields.length > 0) {
+-      const CONCURRENCY_LIMIT = 20;
++      const CONCURRENCY_LIMIT = 8;
        const limit = pLimit(CONCURRENCY_LIMIT);
  
 -      console.log(
@@ -231,16 +904,29 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql
  
        const processProduct = async (parsedProduct: any, index: number) => {
          const productStart = Date.now();
-@@ -250,7 +260,7 @@
-           let imagesIds = [];
+@@ -246,19 +375,9 @@
+             'name',
+           );
  
-           if (parsedProduct?.images?.length) {
+-          let isImagesIds = true;
+-          let imagesIds = [];
++          const isImagesIds = imagesValidByIdx.get(index) ?? true;
++          const imagesIds = imageIdsByIdx.get(index) ?? [];
+ 
+-          if (parsedProduct?.images?.length) {
 -            const { isImagesIdsValid, imagesIdsArray } = await checkAllImages(
-+            const {isImagesIdsValid, imagesIdsArray} = await checkAllImages(
-               parsedProduct?.images,
-               tenantFilter.tenant,
-               true,
-@@ -272,7 +282,7 @@
+-              parsedProduct?.images,
+-              tenantFilter.tenant,
+-              true,
+-            );
+-            isImagesIds = isImagesIdsValid;
+-            imagesIds = imagesIdsArray;
+-          }
+-
+           const isAllBusinessLocationsExists = isRelationEntitiesValid(
+             businessLocationEntities,
+             parsedProduct,
+@@ -272,7 +391,7 @@
  
            const isExistedProductBarcodes = Boolean(
              existedProductBarcodes?.length &&
@@ -249,7 +935,26 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql
            );
  
            const isAllVendorsExist =
-@@ -393,7 +403,7 @@
+@@ -291,17 +410,7 @@
+               'company',
+             );
+ 
+-          let isAllSerialNumbersAvailable = true;
+-          if (parsedProduct?.productItems?.length) {
+-            const checks = parsedProduct.productItems.map((productItem: any) =>
+-              checkSerialNumbersAvailability({
+-                serialNumbers: productItem?.serialNumbers,
+-                tenantFilter,
+-              }).then((res) => res.isAllSerialNumbersAvailable),
+-            );
+-            const results = await Promise.all(checks);
+-            isAllSerialNumbersAvailable = results.every(Boolean);
+-          }
++          const isAllSerialNumbersAvailable = serialsOkByIdx.get(index) ?? true;
+ 
+           if (
+             !isImagesIds ||
+@@ -393,7 +502,7 @@
              const regexedId =
                updatingType !== 'bothDifferent'
                  ? existedProductBarcodes?.[0]?.['productId'] ||
@@ -258,7 +963,7 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql
                  : null;
              const updatingInfo = {
                barcodesUuid: existedProductBarcodes?.[0]?.uuid,
-@@ -462,49 +472,56 @@
+@@ -462,49 +571,56 @@
          ),
        );
  
@@ -353,7 +1058,7 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql
  };
 diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/utils.ts /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/utils.ts
 --- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/utils.ts	2026-01-27 01:28:17
-+++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/utils.ts	2026-02-03 17:31:38
++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/utils.ts	2026-02-04 18:48:51
 @@ -592,36 +592,31 @@
            undefined,
          );
@@ -415,7 +1120,7 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql
  
 diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/resolvers/createProductsFromCSV.ts /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/resolvers/createProductsFromCSV.ts
 --- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/resolvers/createProductsFromCSV.ts	2026-01-27 01:28:17
-+++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/resolvers/createProductsFromCSV.ts	2026-02-03 17:31:38
++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/resolvers/createProductsFromCSV.ts	2026-02-04 18:52:34
 @@ -1,66 +1,215 @@
 -import { errors } from '@strapi/utils';
 -import { GraphQLFieldResolver } from 'graphql';
@@ -670,7 +1375,7 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql
    },
    {
      connection: redisConfig,
-+    concurrency: 4,
++    concurrency: 3,
    },
  );
  
@@ -19967,8 +20672,406 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/index.t
                    .graphqlInfo as GraphQLResolveInfo;
 diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/proj.diff /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/proj.diff
 --- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/proj.diff	1970-01-01 03:00:00
-+++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/proj.diff	2026-02-03 17:35:33
-@@ -0,0 +1,19854 @@
++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/proj.diff	2026-02-04 18:56:15
+@@ -0,0 +1,20557 @@
++diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/CHANGES_DESCRIPTION.md /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/CHANGES_DESCRIPTION.md
++--- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/CHANGES_DESCRIPTION.md	1970-01-01 03:00:00
+++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/CHANGES_DESCRIPTION.md	2026-02-03 17:44:46
++@@ -0,0 +1,394 @@
+++# Детальний опис змін у коді
+++
+++## Огляд
+++Diff-файл містить зміни в 11 файлах, що стосуються оптимізації процесу імпорту продуктів з CSV. Основні зміни спрямовані на:
+++- Розбиття великих імпортів на чанки для паралельної обробки
+++- Оптимізацію створення записів у базі даних
+++- Покращення відстеження прогресу імпорту через Redis
+++- Додавання метаданих для файлів
+++
+++---
+++
+++## 1. `api/chat-notification/controllers/chat-notification.ts`
+++
+++**Зміни:**
+++- Видалено закоментований код з прикладом webhook-даних для події `onMessageAdded`
+++- Прибрано 19 рядків коментарів з прикладом структури даних Twilio webhook
+++
+++**Причина:** Очищення коду від застарілих коментарів
+++
+++---
+++
+++## 2. `api/redis/helpers/utils/importChunksCounter.ts` ⭐ НОВИЙ ФАЙЛ
+++
+++**Призначення:** Утиліти для відстеження прогресу обробки чанків імпорту через Redis
+++
+++**Додані функції:**
+++
+++### `setChunksTotal(generatedRegex, tenantId, total)`
+++- Встановлює загальну кількість чанків для імпорту
+++- Ініціалізує лічильник виконаних чанків на 0
+++
+++### `incrChunksDone(generatedRegex, tenantId)`
+++- Збільшує лічильник виконаних чанків на 1
+++- Повертає поточне значення
+++
+++### `getChunksTotal(generatedRegex, tenantId)`
+++- Отримує загальну кількість чанків
+++
+++### `getChunksDone(generatedRegex, tenantId)`
+++- Отримує кількість виконаних чанків
+++
+++### `addProductTimes(generatedRegex, tenantId, productTimes)`
+++- Додає масив часів обробки продуктів до Redis списку
+++- Використовує `RPUSH` для додавання значень
+++
+++### `getAllProductTimes(generatedRegex, tenantId)`
+++- Отримує всі збережені часи обробки продуктів
+++- Повертає масив чисел
+++
+++### `clearProductTimes(generatedRegex, tenantId)`
+++- Видаляє всі збережені часи обробки продуктів
+++
+++**Структура ключів Redis:**
+++```
+++{PRODUCTS_IMPORT_IDENTIFIER}:{tenantId}:{generatedRegex}:chunksTotal
+++{PRODUCTS_IMPORT_IDENTIFIER}:{tenantId}:{generatedRegex}:chunksDone
+++{PRODUCTS_IMPORT_IDENTIFIER}:{tenantId}:{generatedRegex}:productTimes
+++```
+++
+++---
+++
+++## 3. `graphql/helpers/importingHelpers/fileHelper.ts`
+++
+++**Зміни:**
+++- Додано запис метаданих у `provider_metadata` перед завантаженням файлу
+++- Зберігається `uploadedByUserId` та `tenantId` для подальшого використання
+++
+++**Код:**
+++```typescript
+++entity.provider_metadata = {
+++  ...(entity.provider_metadata ?? {}),
+++  uploadedByUserId: userId,
+++  tenantId: tenantFilter?.tenant,
+++};
+++```
+++
+++**Причина:** Дозволяє отримати інформацію про користувача, який завантажив файл, навіть коли контекст недоступний (наприклад, у воркерах)
+++
+++---
+++
+++## 4. `graphql/helpers/importingHelpers/redisHelpers.ts`
+++
+++**Додані імпорти:**
+++- `completedImportingData` - для збереження успішно імпортованих продуктів
+++- `updatingImportingData` - для збереження продуктів, що потребують оновлення
+++
+++**Нові функції:**
+++
+++### `safeJsonParse<T>(s: string): T | null`
+++- Безпечний парсинг JSON з обробкою помилок
+++- Повертає `null` при невалідному JSON
+++
+++### `loadImportingList<T>(generatedRegex, tenantId, importIdentifier, generator)`
+++- Завантажує список об'єктів з Redis списку
+++- Генерує ключ через функцію `generator`
+++- Парсить JSON з кожного елемента списку
+++- Фільтрує невалідні записи
+++- **Примітка:** Порядок зворотний через використання `LPUSH`, але для репорту не критично
+++
+++### `loadAllImportingResults(generatedRegex, tenantId, importIdentifier)`
+++- Завантажує всі результати імпорту одночасно через `Promise.all`
+++- Повертає об'єкт з трьома списками:
+++  - `spoiled` - зіпсовані записи
+++  - `completed` - успішно імпортовані
+++  - `updating` - записи, що оновлюються
+++
+++**Причина:** Централізоване завантаження результатів імпорту для фіналізації
+++
+++---
+++
+++## 5. `graphql/models/contact/types/types.ts`
+++
+++**Зміни:**
+++- Додано опціональне поле `provider_metadata?: Record<string, any>` до інтерфейсу
+++
+++**Причина:** Підтримка метаданих файлів у типізації
+++
+++---
+++
+++## 6. `graphql/models/product/helpers/importing/utils/helpers/handleNormalisedFields.ts`
+++
+++**Основні зміни:**
+++
+++### Додано параметр `options`:
+++```typescript
+++options?: {
+++  skipFinalize?: boolean;  // Пропустити фіналізацію імпорту
+++  skipLogs?: boolean;      // Пропустити логування
+++  totalProducts?: number; // Загальна кількість продуктів (для прогресу)
+++}
+++```
+++
+++### Змінено сигнатуру функції:
+++- Додано опціональний параметр `options`
+++- Змінено тип повернення на `Promise<{ productTimes: number[] }>`
+++- Функція тепер повертає масив часів обробки кожного продукту
+++
+++### Логіка обробки:
+++
+++1. **Умовне логування:**
+++   - Всі `console.log` обгорнуті перевіркою `if (!skipLogs)`
+++   - Дозволяє прибрати зайве логування при паралельній обробці
+++
+++2. **Умовна фіналізація:**
+++   - Виклик `processAndUpdateImports` обгорнуто в `if (!skipFinalize)`
+++   - Дозволяє відкласти фіналізацію до завершення всіх чанків
+++
+++3. **Підтримка загальної кількості продуктів:**
+++   - Використовується `totalProducts` з опцій або `normalizedFields.length`
+++   - Дозволяє показувати правильний прогрес при обробці чанків
+++
+++4. **Повернення метрик:**
+++   - Функція повертає `{ productTimes: number[] }` для збору статистики
+++
+++5. **Форматування коду:**
+++   - Виправлено форматування у кількох місцях (пробіли, відступи)
+++
+++**Причина:** Підтримка чанкової обробки з можливістю відкласти фіналізацію та зібрати статистику
+++
+++---
+++
+++## 7. `graphql/models/product/helpers/importing/utils/utils.ts`
+++
+++**Оптимізація створення записів інвентаризації:**
+++
+++### До змін:
+++- Створення записів по одному через `strapi.entityService.create`
+++- Розмір чанка: 100 записів
+++- Використання `Promise.all` для паралельного створення
+++
+++### Після змін:
+++- Використання `strapi.db.query().createMany()` для масового створення
+++- Розмір чанка: 500 записів (збільшено в 5 разів)
+++- Створення всіх записів одночасно через `Array.from()`
+++- Більш ефективне використання бази даних
+++
+++**Код:**
+++```typescript
+++const RECORD_BATCH = 500;
+++const INV_RECORD_UID = 'api::invt-itm-record.invt-itm-record';
+++
+++const rows = Array.from({ length: quantity }, () => ({ ...baseRecord }));
+++
+++for (let i = 0; i < rows.length; i += RECORD_BATCH) {
+++  const chunk = rows.slice(i, i + RECORD_BATCH);
+++  await strapi.db.query(INV_RECORD_UID).createMany({ data: chunk });
+++}
+++```
+++
+++**Переваги:**
+++- Значно швидше створення великої кількості записів
+++- Менше запитів до бази даних
+++- Краще використання транзакцій БД
+++
+++---
+++
+++## 8. `graphql/models/product/resolvers/createProductsFromCSV.ts` ⭐ МАСШТАБНІ ЗМІНИ
+++
+++**Основна мета:** Рефакторинг для підтримки чанкової обробки великих імпортів
+++
+++### Структурні зміни:
+++
+++#### A. Додано нові імпорти:
+++- `importChunksCounter` - утиліти для відстеження чанків
+++- `loadAllImportingResults` - завантаження результатів
+++- `processAndUpdateImports` - фіналізація імпорту
+++- `processProductsImport` - генерація звіту
+++
+++#### B. Додано функцію `chunkArray<T>`:
+++```typescript
+++const chunkArray = <T,>(arr: T[], size: number): T[][] => {
+++  const out: T[][] = [];
+++  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+++  return out;
+++};
+++```
+++- Розбиває масив на чанки заданого розміру
+++
+++#### C. Рефакторинг Worker'а:
+++
+++**До:** Один тип завдання, що обробляє всі продукти одразу
+++
+++**Після:** Три типи завдань:
+++
+++1. **`products-chunk`** - обробка одного чанка продуктів:
+++   - Отримує чанк нормалізованих полів
+++   - Викликає `handleNormalisedProductsFields` з `skipFinalize: true` та `skipLogs: true`
+++   - Зберігає часи обробки через `addProductTimes`
+++   - Збільшує лічильник виконаних чанків
+++   - Логує прогрес
+++
+++2. **`products-finalize`** - фіналізація імпорту:
+++   - Перевіряє, чи всі чанки виконані
+++   - Якщо ні - переплановує себе з затримкою 2 секунди
+++   - Якщо так - завантажує всі результати з Redis
+++   - Викликає `processAndUpdateImports` для фіналізації
+++   - Виводить статистику по часу обробки
+++   - Очищає тимчасові дані
+++
+++3. **Unknown job** - обробка невідомих типів завдань
+++
+++#### D. Налаштування Worker'а:
+++- Додано `concurrency: 4` - одночасно обробляється до 4 чанків
+++
+++#### E. Зміни в resolver'і `createProductsFromCSV`:
+++
+++**До:**
+++```typescript
+++await productsImportFieldsQueue.add(PRODUCTS_IMPORT_IDENTIFIER, {
+++  normalizedFields, // всі продукти одразу
+++  // ... інші дані
+++});
+++```
+++
+++**Після:**
+++```typescript
+++const CHUNK_SIZE = 50;
+++const chunks = chunkArray(normalizedFields, CHUNK_SIZE);
+++const totalProducts = normalizedFields.length;
+++
+++// Встановлюємо загальну кількість чанків
+++await setChunksTotal(generatedRegex, tenantFilter?.tenant, chunks.length);
+++
+++// Додаємо всі чанки одночасно
+++await productsImportFieldsQueue.addBulk(
+++  chunks.map((fieldsChunk, idx) => ({
+++    name: 'products-chunk',
+++    data: {
+++      normalizedFields: fieldsChunk,
+++      chunkIndex: idx,
+++      chunksTotal: chunks.length,
+++      totalProducts,
+++      // ... інші дані
+++    },
+++  }))
+++);
+++
+++// Додаємо завдання фіналізації
+++await productsImportFieldsQueue.add('products-finalize', {
+++  // ... дані для фіналізації
+++}, {
+++  delay: 1000, // затримка 1 секунда
+++});
+++```
+++
+++### Переваги нової архітектури:
+++
+++1. **Паралельна обробка:** До 4 чанків обробляються одночасно
+++2. **Масштабованість:** Великі імпорти не блокуют систему
+++3. **Відстеження прогресу:** Можна відстежувати прогрес через Redis
+++4. **Відмовостійкість:** Якщо один чанк падає, інші продовжують обробку
+++5. **Статистика:** Збір метрик по часу обробки кожного продукту
+++
+++### Логування:
+++- `IMPORT_SESSION_START` - початок сесії імпорту
+++- `IMPORT_CHUNK_START` - початок обробки чанка
+++- `IMPORT_CHUNK_COMPLETE` - завершення чанка
+++- `IMPORT_SESSION_PROGRESS` - прогрес обробки
+++- `IMPORT_TIMING` - статистика по часу
+++
+++---
+++
+++## 9. `graphql/schema.graphql`
+++
+++**Зміни:**
+++- Автоматично згенерований файл схеми GraphQL
+++- Містить повну схему з усіма типами, входами та виходами
+++- Файл містить 19138 рядків (повна схема системи)
+++
+++**Примітка:** Це автогенерований файл, зміни в ньому відображають оновлення схеми через зміни в коді
+++
+++---
+++
+++## 10. `index.ts`
+++
+++**Зміни в обробці завантаження файлів:**
+++
+++### До:
+++```typescript
+++const userId = ctx?.state?.user?.id;
+++```
+++
+++### Після:
+++```typescript
+++let userId;
+++if (ctx) {
+++  userId = ctx?.state?.user?.id;
+++} else {
+++  const meta = file?.provider_metadata || {};
+++  userId = meta?.uploadedByUserId;
+++}
+++```
+++
+++**Додано перевірку:**
+++```typescript
+++if (!ctx) return; // cannot update counts without a context
+++```
+++
+++**Причина:** 
+++- Дозволяє отримати `userId` навіть коли контекст недоступний (наприклад, у воркерах)
+++- Використовує збережені метадані з `provider_metadata`
+++- Запобігає помилкам при оновленні лічильників без контексту
+++
+++---
+++
+++## 11. `proj.diff`
+++
+++**Зміни:**
+++- Сам diff-файл додано до репозиторію
+++- Містить всі описані вище зміни
+++
+++---
+++
+++## Загальний вплив змін
+++
+++### Проблеми, що вирішуються:
+++
+++1. **Продуктивність:**
+++   - Великі імпорти тепер обробляються паралельно
+++   - Оптимізовано створення записів у БД (createMany замість окремих create)
+++   - Зменшено навантаження на систему
+++
+++2. **Масштабованість:**
+++   - Система може обробляти імпорти будь-якого розміру
+++   - Чанки обробляються незалежно один від одного
+++
+++3. **Відстеження:**
+++   - Покращено відстеження прогресу через Redis
+++   - Збір статистики по часу обробки
+++   - Можливість моніторингу стану імпорту
+++
+++4. **Надійність:**
+++   - Відмовостійкість при обробці великих імпортів
+++   - Можливість відновлення після помилок
+++   - Логування на кожному етапі
+++
+++### Технічні деталі:
+++
+++- **Розмір чанка:** 50 продуктів на чанк
+++- **Конкурентність:** До 4 чанків одночасно
+++- **Розмір батчу БД:** 500 записів
+++- **Затримка фіналізації:** 1 секунда (з можливістю повторного планування)
+++
+++---
+++
+++## Висновок
+++
+++Зміни представляють собою масштабну оптимізацію системи імпорту продуктів, що дозволяє:
+++- Ефективно обробляти великі обсяги даних
+++- Паралельно обробляти кілька чанків
+++- Відстежувати прогрес та збирати статистику
+++- Підвищити продуктивність через оптимізацію запитів до БД
+++
+++Всі зміни зворотно сумісні та не порушують існуючий функціонал.
 +diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/api/chat-notification/controllers/chat-notification.ts /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/api/chat-notification/controllers/chat-notification.ts
 +--- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/api/chat-notification/controllers/chat-notification.ts	2026-01-27 01:28:17
 ++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/api/chat-notification/controllers/chat-notification.ts	2026-02-03 17:31:39
@@ -20139,6 +21242,69 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/proj.di
 ++
 ++  return { spoiled, completed, updating };
 + };
++diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/helpers/importingHelpers/utils.ts /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/helpers/importingHelpers/utils.ts
++--- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/helpers/importingHelpers/utils.ts	2026-01-27 01:28:17
+++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/helpers/importingHelpers/utils.ts	2026-02-04 18:03:27
++@@ -1,3 +1,4 @@
+++import pLimit from 'p-limit';
++ import Papa from 'papaparse';
++ import { COMPANIES_EXPECTED_VALUES } from './../../models/company/helpers/utils/variables';
++ import {
++@@ -91,6 +92,54 @@
++     isImagesIdsValid: isImages,
++     imagesIdsArray: imagesArray,
++   };
+++};
+++
+++export type ImageKey = string;
+++export const getImageKey = (img: any): ImageKey => {
+++  if (!img) return '';
+++  if (typeof img === 'string') return img;
+++  return String(img.url ?? img.id ?? img.key ?? img.name ?? '');
+++};
+++
+++export const checkAllImagesBulkCached = async (
+++  images: any[],
+++  tenantId: any,
+++  isImageCheck = false,
+++  concurrency = 20,
+++) => {
+++  // key -> { ok, id }
+++  const cache = new Map<ImageKey, Promise<{ ok: boolean; id?: any }>>();
+++  const limit = pLimit(concurrency);
+++
+++  const ensure = (img: any) => {
+++    const key = getImageKey(img);
+++    if (!key) return Promise.resolve({
+++      ok: false,
+++      id: undefined
+++    });
+++
+++    let p = cache.get(key);
+++    if (!p) {
+++      p = limit(async () => {
+++        const { isAvatarValid, fileFoundId } = await validateAndGetAvatarFileId(
+++          img,
+++          tenantId,
+++          isImageCheck,
+++        );
+++        return { ok: Boolean(isAvatarValid), id: fileFoundId };
+++      });
+++      cache.set(key, p);
+++    }
+++    return p;
+++  };
+++
+++  // важливо: порядок зберігаємо як у input images
+++  const results = await Promise.all(images.map((img) => ensure(img)));
+++
+++  const isImagesIdsValid = results.every((r) => r.ok);
+++  const imagesIdsArray = isImagesIdsValid ? results.map((r) => r.id) : [];
+++
+++  return { isImagesIdsValid, imagesIdsArray, cache };
++ };
++ 
++ export const parseHeaders = (
 +diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/contact/types/types.ts /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/contact/types/types.ts
 +--- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/contact/types/types.ts	2026-01-27 01:28:17
 ++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/contact/types/types.ts	2026-02-03 17:31:38
@@ -20148,10 +21314,93 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/proj.di
 +   getStream?: () => Readable;
 ++  provider_metadata?: Record<string, any>;
 + }
++diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/actions/handleNormalisedFields/checkSerialNumbersAvailability.ts /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/actions/handleNormalisedFields/checkSerialNumbersAvailability.ts
++--- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/actions/handleNormalisedFields/checkSerialNumbersAvailability.ts	2026-01-27 01:28:17
+++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/actions/handleNormalisedFields/checkSerialNumbersAvailability.ts	2026-02-04 17:44:59
++@@ -55,3 +55,55 @@
++     handleError('checkSerialNumbersAvailability', undefined, e);
++   }
++ };
+++
+++export const checkSerialNumbersAvailabilityBulk = async ({
+++  serialNumbers,
+++  tenantFilter,
+++}: {
+++  serialNumbers: string[];
+++  tenantFilter: any;
+++}) => {
+++  const unique = Array.from(
+++    new Set(serialNumbers.filter(Boolean).map((s) => String(s).trim())),
+++  );
+++
+++  if (unique.length === 0) {
+++    return { busySerials: new Set<string>() };
+++  }
+++
+++  const existed = await strapi.entityService.findMany(
+++    'api::inventory-serialize.inventory-serialize',
+++    {
+++      filters: {
+++        ...tenantFilter,
+++        name: { $in: unique },
+++      },
+++      fields: ['name'],
+++      populate: {
+++        sellingProductOrderItem: { fields: ['id'] },
+++        returnItem: { fields: ['id'] },
+++        inventoryAdjustmentItem: { fields: ['id'] },
+++        transferOrderItem: { fields: ['id'] },
+++        productInventoryItem: { fields: ['id'] },
+++      },
+++    },
+++  );
+++
+++  const busySerials = new Set<string>();
+++
+++  for (const sn of existed as any[]) {
+++    const name = String(sn?.name ?? '').trim();
+++    if (!name) continue;
+++
+++    const hasRelations =
+++      sn?.sellingProductOrderItem?.id ||
+++      sn?.returnItem?.id ||
+++      sn?.inventoryAdjustmentItem?.id ||
+++      sn?.transferOrderItem?.id ||
+++      sn?.productInventoryItem?.id;
+++
+++    if (hasRelations) busySerials.add(name);
+++  }
+++
+++  return { busySerials };
+++};
 +diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/handleNormalisedFields.ts /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/handleNormalisedFields.ts
 +--- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/handleNormalisedFields.ts	2026-01-27 01:28:17
-++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/handleNormalisedFields.ts	2026-02-03 17:31:38
-+@@ -32,9 +32,16 @@
+++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/helpers/handleNormalisedFields.ts	2026-02-04 18:52:34
++@@ -4,12 +4,13 @@
++ import { handleLogger } from './../../../../../../helpers/errors';
++ import { processAndUpdateImports } from './../../../../../../helpers/importingHelpers/fileHelper';
++ import {
++-  checkAllImages,
+++  checkAllImagesBulkCached,
++   findCashPaymentMethodId,
++   findCostOfGoodsAccountId,
++   findExistingRelationEntities,
++   findOrCreateEntities,
++   getExistingEntitiesByFieldBatch,
+++  getImageKey,
++ } from './../../../../../../helpers/importingHelpers/utils';
++ import { processProductsImport } from './../../../createProductsFromCSV/generateImportReport';
++ import {
++@@ -19,7 +20,7 @@
++   handleSpoiledCreations,
++ } from './../../../importing/productImport';
++ import { validateProductQuantities } from './../../../importing/utils/utils';
++-import { checkSerialNumbersAvailability } from './../helpers/actions/handleNormalisedFields/checkSerialNumbersAvailability';
+++import { checkSerialNumbersAvailabilityBulk } from './../helpers/actions/handleNormalisedFields/checkSerialNumbersAvailability';
++ import {
++   batchProcessCustomAttributes,
++   getProductAttributeOptionIds,
++@@ -32,9 +33,16 @@
 +   { maxImagesCount, maxProductsCount, customFieldsArr, maxSerialNumbersCount },
 +   config,
 +   currentSessionId,
@@ -20170,7 +21419,132 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/proj.di
 +   const allNames = normalizedFields
 +     .map((product) => product.name)
 +     .filter(Boolean);
-+@@ -181,7 +188,7 @@
++@@ -109,6 +117,124 @@
++     batchProcessCustomAttributes(normalizedFields, tenantFilter?.tenant),
++   ]);
++ 
+++  // -------------------------
+++  // PREFETCH (per chunk)
+++  // -------------------------
+++
+++  // 2.1 Images prefetch (1 call per chunk)
+++  // IMPORTANT: relies on checkAllImagesBulkCached returning ids in the same order as input images array
+++  const imagesValidByIdx = new Map<number, boolean>();
+++  const imageIdsByIdx = new Map<number, any[]>();
+++
+++  (() => {
+++    normalizedFields.forEach((_, idx) => {
+++      imagesValidByIdx.set(idx, true);
+++      imageIdsByIdx.set(idx, []);
+++    });
+++  })();
+++
+++  const uniqueImageKeyToRef = new Map<string, any>();
+++  const productImageKeysByIdx = new Map<number, string[]>();
+++
+++  normalizedFields.forEach((product, idx) => {
+++    const productImages = Array.isArray(product?.images) ? product.images : [];
+++    const imageKeys = productImages.map(getImageKey).filter(Boolean);
+++
+++    productImageKeysByIdx.set(idx, imageKeys);
+++
+++    for (let imageIndex = 0; imageIndex < productImages.length; imageIndex++) {
+++      const imageKey = getImageKey(productImages[imageIndex]);
+++      if (imageKey) uniqueImageKeyToRef.set(imageKey, productImages[imageIndex]);
+++    }
+++  });
+++
+++  if (uniqueImageKeyToRef.size > 0) {
+++    const allUniqueImages = Array.from(uniqueImageKeyToRef.values());
+++
+++    const { cache: imageCache } = await checkAllImagesBulkCached(
+++      allUniqueImages,
+++      tenantFilter.tenant,
+++      true,
+++      20,
+++    );
+++
+++    for (let idx = 0; idx < normalizedFields.length; idx++) {
+++      const product = normalizedFields[idx];
+++      const productImages = Array.isArray(product?.images) ? product.images : [];
+++      if (productImages.length === 0) {
+++        imagesValidByIdx.set(idx, true);
+++        imageIdsByIdx.set(idx, []);
+++        continue;
+++      }
+++
+++      const imageValidationChecks = await Promise.all(
+++        productImages.map(async (img) => {
+++          const imageKey = getImageKey(img);
+++          const cachedPromise = imageCache?.get(imageKey);
+++          return cachedPromise ?? Promise.resolve({ ok: false });
+++        }),
+++      );
+++
+++      const allImagesValid = imageValidationChecks.every((r) => r.ok);
+++      imagesValidByIdx.set(idx, allImagesValid);
+++      imageIdsByIdx.set(
+++        idx,
+++        allImagesValid ? imageValidationChecks.map((r) => r.id) : [],
+++      );
+++    }
+++  }
+++
+++  // 2.2 Serial numbers prefetch (1 call per chunk)
+++  const serialsOkByIdx = new Map<number, boolean>();
+++
+++  const allChunkSerialsSet = new Set<string>();
+++
+++  normalizedFields.forEach((product) => {
+++    const productItems = Array.isArray(product?.productItems)
+++      ? product.productItems
+++      : [];
+++    for (const productItem of productItems) {
+++      const serialNumbers = Array.isArray(productItem?.serialNumbers)
+++        ? productItem.serialNumbers
+++        : [];
+++      for (const serialNumber of serialNumbers) {
+++        const trimmedSerial = String(serialNumber).trim();
+++        if (trimmedSerial) allChunkSerialsSet.add(trimmedSerial);
+++      }
+++    }
+++  });
+++
+++  let busySerials = new Set<string>();
+++  if (allChunkSerialsSet.size > 0) {
+++    const bulkCheckResult = await checkSerialNumbersAvailabilityBulk({
+++      serialNumbers: Array.from(allChunkSerialsSet),
+++      tenantFilter,
+++    });
+++    busySerials = bulkCheckResult.busySerials;
+++  }
+++
+++  normalizedFields.forEach((product, idx) => {
+++    const productItems = Array.isArray(product?.productItems)
+++      ? product.productItems
+++      : [];
+++    const productSerials: string[] = [];
+++
+++    for (const productItem of productItems) {
+++      const serialNumbers = Array.isArray(productItem?.serialNumbers)
+++        ? productItem.serialNumbers
+++        : [];
+++      for (const serialNumber of serialNumbers) {
+++        const trimmedSerial = String(serialNumber).trim();
+++        if (trimmedSerial) productSerials.push(trimmedSerial);
+++      }
+++    }
+++
+++    const allSerialsAvailable = productSerials.every(
+++      (trimmedSerial) => !busySerials.has(trimmedSerial),
+++    );
+++    serialsOkByIdx.set(idx, allSerialsAvailable);
+++  });
+++
++   const getEntityIdByName = (
++     entityArray: any[],
++     name: string,
++@@ -181,7 +307,7 @@
 + 
 +   // Monitoring metrics
 +   const metrics = {
@@ -20179,7 +21553,7 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/proj.di
 +     processed: 0,
 +     active: 0,
 +     maxActive: 0,
-+@@ -192,6 +199,7 @@
++@@ -192,6 +318,7 @@
 +   };
 + 
 +   const logProgress = () => {
@@ -20187,8 +21561,12 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/proj.di
 +     console.log(
 +       `[IMPORT PROGRESS] Processed: ${metrics.processed}/${metrics.totalProducts} | ` +
 +         `Active: ${metrics.active} | MaxActive: ${metrics.maxActive} | ` +
-+@@ -204,9 +212,11 @@
-+       const CONCURRENCY_LIMIT = 20;
++@@ -201,12 +328,14 @@
++ 
++   try {
++     if (normalizedFields.length > 0) {
++-      const CONCURRENCY_LIMIT = 20;
+++      const CONCURRENCY_LIMIT = 8;
 +       const limit = pLimit(CONCURRENCY_LIMIT);
 + 
 +-      console.log(
@@ -20202,16 +21580,29 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/proj.di
 + 
 +       const processProduct = async (parsedProduct: any, index: number) => {
 +         const productStart = Date.now();
-+@@ -250,7 +260,7 @@
-+           let imagesIds = [];
++@@ -246,19 +375,9 @@
++             'name',
++           );
 + 
-+           if (parsedProduct?.images?.length) {
++-          let isImagesIds = true;
++-          let imagesIds = [];
+++          const isImagesIds = imagesValidByIdx.get(index) ?? true;
+++          const imagesIds = imageIdsByIdx.get(index) ?? [];
++ 
++-          if (parsedProduct?.images?.length) {
 +-            const { isImagesIdsValid, imagesIdsArray } = await checkAllImages(
-++            const {isImagesIdsValid, imagesIdsArray} = await checkAllImages(
-+               parsedProduct?.images,
-+               tenantFilter.tenant,
-+               true,
-+@@ -272,7 +282,7 @@
++-              parsedProduct?.images,
++-              tenantFilter.tenant,
++-              true,
++-            );
++-            isImagesIds = isImagesIdsValid;
++-            imagesIds = imagesIdsArray;
++-          }
++-
++           const isAllBusinessLocationsExists = isRelationEntitiesValid(
++             businessLocationEntities,
++             parsedProduct,
++@@ -272,7 +391,7 @@
 + 
 +           const isExistedProductBarcodes = Boolean(
 +             existedProductBarcodes?.length &&
@@ -20220,7 +21611,26 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/proj.di
 +           );
 + 
 +           const isAllVendorsExist =
-+@@ -393,7 +403,7 @@
++@@ -291,17 +410,7 @@
++               'company',
++             );
++ 
++-          let isAllSerialNumbersAvailable = true;
++-          if (parsedProduct?.productItems?.length) {
++-            const checks = parsedProduct.productItems.map((productItem: any) =>
++-              checkSerialNumbersAvailability({
++-                serialNumbers: productItem?.serialNumbers,
++-                tenantFilter,
++-              }).then((res) => res.isAllSerialNumbersAvailable),
++-            );
++-            const results = await Promise.all(checks);
++-            isAllSerialNumbersAvailable = results.every(Boolean);
++-          }
+++          const isAllSerialNumbersAvailable = serialsOkByIdx.get(index) ?? true;
++ 
++           if (
++             !isImagesIds ||
++@@ -393,7 +502,7 @@
 +             const regexedId =
 +               updatingType !== 'bothDifferent'
 +                 ? existedProductBarcodes?.[0]?.['productId'] ||
@@ -20229,7 +21639,7 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/proj.di
 +                 : null;
 +             const updatingInfo = {
 +               barcodesUuid: existedProductBarcodes?.[0]?.uuid,
-+@@ -462,49 +472,56 @@
++@@ -462,49 +571,56 @@
 +         ),
 +       );
 + 
@@ -20324,7 +21734,7 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/proj.di
 + };
 +diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/utils.ts /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/utils.ts
 +--- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/utils.ts	2026-01-27 01:28:17
-++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/utils.ts	2026-02-03 17:31:38
+++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/helpers/importing/utils/utils.ts	2026-02-04 18:48:51
 +@@ -592,36 +592,31 @@
 +           undefined,
 +         );
@@ -20386,7 +21796,7 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/proj.di
 + 
 +diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/resolvers/createProductsFromCSV.ts /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/resolvers/createProductsFromCSV.ts
 +--- /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/graphql/models/product/resolvers/createProductsFromCSV.ts	2026-01-27 01:28:17
-++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/resolvers/createProductsFromCSV.ts	2026-02-03 17:31:38
+++++ /System/Volumes/Data/srv/httpd/importing-test-task/importing-test/packages/cms/src/graphql/models/product/resolvers/createProductsFromCSV.ts	2026-02-04 18:52:34
 +@@ -1,66 +1,215 @@
 +-import { errors } from '@strapi/utils';
 +-import { GraphQLFieldResolver } from 'graphql';
@@ -20641,7 +22051,7 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/proj.di
 +   },
 +   {
 +     connection: redisConfig,
-++    concurrency: 4,
+++    concurrency: 3,
 +   },
 + );
 + 
@@ -39821,5 +41231,3 @@ diff -ruN /System/Volumes/Data/srv/httpd/importing-test/packages/cms/src/proj.di
 ++  createdAt: DateTimeFilterInput
 ++  entityType: StringFilterInput
 ++  id: IDFilterInput
-++  not: ZapierWebhookFiltersInput
-++  or: [ZapierWe

@@ -4,12 +4,13 @@ import redis from './../../../../../../../api/redis/redis';
 import { handleLogger } from './../../../../../../helpers/errors';
 import { processAndUpdateImports } from './../../../../../../helpers/importingHelpers/fileHelper';
 import {
-  checkAllImages,
+  checkAllImagesBulkCached,
   findCashPaymentMethodId,
   findCostOfGoodsAccountId,
   findExistingRelationEntities,
   findOrCreateEntities,
   getExistingEntitiesByFieldBatch,
+  getImageKey,
 } from './../../../../../../helpers/importingHelpers/utils';
 import { processProductsImport } from './../../../createProductsFromCSV/generateImportReport';
 import {
@@ -19,7 +20,7 @@ import {
   handleSpoiledCreations,
 } from './../../../importing/productImport';
 import { validateProductQuantities } from './../../../importing/utils/utils';
-import { checkSerialNumbersAvailability } from './../helpers/actions/handleNormalisedFields/checkSerialNumbersAvailability';
+import { checkSerialNumbersAvailabilityBulk } from './../helpers/actions/handleNormalisedFields/checkSerialNumbersAvailability';
 import {
   batchProcessCustomAttributes,
   getProductAttributeOptionIds,
@@ -116,6 +117,124 @@ export const handleNormalisedProductsFields = async (
     batchProcessCustomAttributes(normalizedFields, tenantFilter?.tenant),
   ]);
 
+  // -------------------------
+  // PREFETCH (per chunk)
+  // -------------------------
+
+  // 2.1 Images prefetch (1 call per chunk)
+  // IMPORTANT: relies on checkAllImagesBulkCached returning ids in the same order as input images array
+  const imagesValidByIdx = new Map<number, boolean>();
+  const imageIdsByIdx = new Map<number, any[]>();
+
+  (() => {
+    normalizedFields.forEach((_, idx) => {
+      imagesValidByIdx.set(idx, true);
+      imageIdsByIdx.set(idx, []);
+    });
+  })();
+
+  const uniqueImageKeyToRef = new Map<string, any>();
+  const productImageKeysByIdx = new Map<number, string[]>();
+
+  normalizedFields.forEach((product, idx) => {
+    const productImages = Array.isArray(product?.images) ? product.images : [];
+    const imageKeys = productImages.map(getImageKey).filter(Boolean);
+
+    productImageKeysByIdx.set(idx, imageKeys);
+
+    for (let imageIndex = 0; imageIndex < productImages.length; imageIndex++) {
+      const imageKey = getImageKey(productImages[imageIndex]);
+      if (imageKey) uniqueImageKeyToRef.set(imageKey, productImages[imageIndex]);
+    }
+  });
+
+  if (uniqueImageKeyToRef.size > 0) {
+    const allUniqueImages = Array.from(uniqueImageKeyToRef.values());
+
+    const { cache: imageCache } = await checkAllImagesBulkCached(
+      allUniqueImages,
+      tenantFilter.tenant,
+      true,
+      20,
+    );
+
+    for (let idx = 0; idx < normalizedFields.length; idx++) {
+      const product = normalizedFields[idx];
+      const productImages = Array.isArray(product?.images) ? product.images : [];
+      if (productImages.length === 0) {
+        imagesValidByIdx.set(idx, true);
+        imageIdsByIdx.set(idx, []);
+        continue;
+      }
+
+      const imageValidationChecks = await Promise.all(
+        productImages.map(async (img) => {
+          const imageKey = getImageKey(img);
+          const cachedPromise = imageCache?.get(imageKey);
+          return cachedPromise ?? Promise.resolve({ ok: false });
+        }),
+      );
+
+      const allImagesValid = imageValidationChecks.every((r) => r.ok);
+      imagesValidByIdx.set(idx, allImagesValid);
+      imageIdsByIdx.set(
+        idx,
+        allImagesValid ? imageValidationChecks.map((r) => r.id) : [],
+      );
+    }
+  }
+
+  // 2.2 Serial numbers prefetch (1 call per chunk)
+  const serialsOkByIdx = new Map<number, boolean>();
+
+  const allChunkSerialsSet = new Set<string>();
+
+  normalizedFields.forEach((product) => {
+    const productItems = Array.isArray(product?.productItems)
+      ? product.productItems
+      : [];
+    for (const productItem of productItems) {
+      const serialNumbers = Array.isArray(productItem?.serialNumbers)
+        ? productItem.serialNumbers
+        : [];
+      for (const serialNumber of serialNumbers) {
+        const trimmedSerial = String(serialNumber).trim();
+        if (trimmedSerial) allChunkSerialsSet.add(trimmedSerial);
+      }
+    }
+  });
+
+  let busySerials = new Set<string>();
+  if (allChunkSerialsSet.size > 0) {
+    const bulkCheckResult = await checkSerialNumbersAvailabilityBulk({
+      serialNumbers: Array.from(allChunkSerialsSet),
+      tenantFilter,
+    });
+    busySerials = bulkCheckResult.busySerials;
+  }
+
+  normalizedFields.forEach((product, idx) => {
+    const productItems = Array.isArray(product?.productItems)
+      ? product.productItems
+      : [];
+    const productSerials: string[] = [];
+
+    for (const productItem of productItems) {
+      const serialNumbers = Array.isArray(productItem?.serialNumbers)
+        ? productItem.serialNumbers
+        : [];
+      for (const serialNumber of serialNumbers) {
+        const trimmedSerial = String(serialNumber).trim();
+        if (trimmedSerial) productSerials.push(trimmedSerial);
+      }
+    }
+
+    const allSerialsAvailable = productSerials.every(
+      (trimmedSerial) => !busySerials.has(trimmedSerial),
+    );
+    serialsOkByIdx.set(idx, allSerialsAvailable);
+  });
+
   const getEntityIdByName = (
     entityArray: any[],
     name: string,
@@ -209,7 +328,7 @@ export const handleNormalisedProductsFields = async (
 
   try {
     if (normalizedFields.length > 0) {
-      const CONCURRENCY_LIMIT = 20;
+      const CONCURRENCY_LIMIT = 8;
       const limit = pLimit(CONCURRENCY_LIMIT);
 
       if (!skipLogs) {
@@ -256,18 +375,8 @@ export const handleNormalisedProductsFields = async (
             'name',
           );
 
-          let isImagesIds = true;
-          let imagesIds = [];
-
-          if (parsedProduct?.images?.length) {
-            const {isImagesIdsValid, imagesIdsArray} = await checkAllImages(
-              parsedProduct?.images,
-              tenantFilter.tenant,
-              true,
-            );
-            isImagesIds = isImagesIdsValid;
-            imagesIds = imagesIdsArray;
-          }
+          const isImagesIds = imagesValidByIdx.get(index) ?? true;
+          const imagesIds = imageIdsByIdx.get(index) ?? [];
 
           const isAllBusinessLocationsExists = isRelationEntitiesValid(
             businessLocationEntities,
@@ -301,17 +410,7 @@ export const handleNormalisedProductsFields = async (
               'company',
             );
 
-          let isAllSerialNumbersAvailable = true;
-          if (parsedProduct?.productItems?.length) {
-            const checks = parsedProduct.productItems.map((productItem: any) =>
-              checkSerialNumbersAvailability({
-                serialNumbers: productItem?.serialNumbers,
-                tenantFilter,
-              }).then((res) => res.isAllSerialNumbersAvailable),
-            );
-            const results = await Promise.all(checks);
-            isAllSerialNumbersAvailable = results.every(Boolean);
-          }
+          const isAllSerialNumbersAvailable = serialsOkByIdx.get(index) ?? true;
 
           if (
             !isImagesIds ||
